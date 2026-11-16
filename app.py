@@ -1,3 +1,5 @@
+# MVP CRM MaisVida Praia - Versão de Homologação v1.1
+
 import html
 import os
 import re
