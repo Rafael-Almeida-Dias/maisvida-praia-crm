@@ -96,7 +96,7 @@ def obter_hash_gestor() -> bytes:
 
     if "fallback_bcrypt_hash" not in st.session_state:
         st.session_state["fallback_bcrypt_hash"] = bcrypt.hashpw(
-            b"MaisVida2026!", bcrypt.gensalt(rounds=12)
+            b"MVGest!", bcrypt.gensalt(rounds=12)
         )
     return st.session_state["fallback_bcrypt_hash"]
 
@@ -104,7 +104,7 @@ def obter_hash_gestor() -> bytes:
 def autenticar_gestor(usuario: str, senha: str) -> bool:
     if st.session_state.get("tentativas_login", 0) >= 5:
         return False
-    if usuario.strip().lower() != "gestor":
+    if usuario.strip().lower() != "gestores":
         st.session_state["tentativas_login"] = st.session_state.get("tentativas_login", 0) + 1
         return False
 
@@ -114,7 +114,7 @@ def autenticar_gestor(usuario: str, senha: str) -> bool:
             st.session_state["tentativas_login"] = 0
             return True
     except ValueError:
-        if senha == "MaisVida2026!":
+        if senha == "MVGest!":
             st.session_state["tentativas_login"] = 0
             return True
 
