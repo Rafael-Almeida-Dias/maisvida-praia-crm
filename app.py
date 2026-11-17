@@ -1,9 +1,10 @@
-# MVP CRM MaisVida Praia - Versão de Homologação v1.1
+# MVP CRM MaisVida Praia - Versão de Homologação v1.2
 
 import html
 import os
 import re
 from datetime import datetime, timedelta
+from urllib.parse import quote
 import bcrypt
 import pandas as pd
 import streamlit as st
@@ -118,20 +119,40 @@ def sanitizar_xss(valor: str) -> str:
     return html.escape(str(valor).strip(), quote=True)
 
 
+def normalizar_data(data_str: str) -> str:
+    """Normaliza datas digitadas sem barras (ex: 15111995) ou com hífen/ponto (15-11-1995) para DD/MM/AAAA."""
+    texto = str(data_str).strip()
+    apenas_digitos = re.sub(r"\D", "", texto)
+    if len(apenas_digitos) == 8:
+        return f"{apenas_digitos[:2]}/{apenas_digitos[2:4]}/{apenas_digitos[4:]}"
+    return re.sub(r"[-.]", "/", texto)
+
+
+def validar_data_nascimento(data_str: str) -> bool:
+    """RF01: Valida se a data normalizada existe no calendário e está em intervalo plausível."""
+    data_norm = normalizar_data(data_str)
+    if not re.match(r"^\d{2}/\d{2}/\d{4}$", data_norm):
+        return False
+    try:
+        dt = datetime.strptime(data_norm, "%d/%m/%Y")
+        if dt > datetime.now() or dt.year < 1920:
+            return False
+        return True
+    except ValueError:
+        return False
+
+
 def validar_dados_aluno(nome: str, data_nasc: str, whatsapp: str) -> list[str]:
-    """RF01: Valida campos obrigatórios e formato estrito de calendário DD/MM/AAAA."""
+    """RF01: Valida campos obrigatórios e formato de calendário DD/MM/AAAA."""
     erros = []
-    if not nome or not nome.strip():
+    if not nome or not str(nome).strip():
         erros.append("⚠️ [ERRO RF01] O 'Nome Completo' é obrigatório.")
-    if not re.match(r"^\d{2}/\d{2}/\d{4}$", str(data_nasc).strip()):
+
+    data_norm = normalizar_data(data_nasc)
+    if not re.match(r"^\d{2}/\d{2}/\d{4}$", data_norm):
         erros.append("⚠️ [ERRO RF01] 'Data de Nascimento' deve estar no formato DD/MM/AAAA.")
-    else:
-        try:
-            dt = datetime.strptime(str(data_nasc).strip(), "%d/%m/%Y")
-            if dt > datetime.now() or dt.year < 1920:
-                erros.append("⚠️ [ERRO RF01] Data de Nascimento inválida ou no futuro.")
-        except ValueError:
-            erros.append("⚠️ [ERRO RF01] Data inexistente no calendário (ex: 32/13/1990).")
+    elif not validar_data_nascimento(data_norm):
+        erros.append("⚠️ [ERRO RF01] Data de Nascimento inexistente no calendário ou no futuro (ex: 32/13/1990).")
 
     apenas_numeros = re.sub(r"\D", "", str(whatsapp))
     if len(apenas_numeros) < 10:
@@ -215,12 +236,13 @@ def criar_aluno(nome: str, data_nasc: str, whatsapp: str, modalidade: str, horar
     df = ler_banco_alunos()
     novo_id = int(df["ID_Aluno"].max()) + 1 if not df.empty else 1
     timestamp_servidor = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    data_formatada = normalizar_data(data_nasc)
 
     novo_registro = pd.DataFrame([{
         "ID_Aluno": novo_id,
         "Data_Cadastro": timestamp_servidor,
         "Nome_Completo": sanitizar_xss(nome),
-        "Data_Nascimento": data_nasc.strip(),
+        "Data_Nascimento": data_formatada,
         "Contato_WhatsApp": re.sub(r"\D", "", whatsapp),
         "Modalidade": modalidade,
         "Horario_Treino": horario,
@@ -239,7 +261,7 @@ def atualizar_aluno(id_aluno: int, nome: str, data_nasc: str, whatsapp: str, mod
     if len(idx) > 0:
         i = idx[0]
         df.at[i, "Nome_Completo"] = sanitizar_xss(nome)
-        df.at[i, "Data_Nascimento"] = data_nasc.strip()
+        df.at[i, "Data_Nascimento"] = normalizar_data(data_nasc)
         df.at[i, "Contato_WhatsApp"] = re.sub(r"\D", "", whatsapp)
         df.at[i, "Modalidade"] = modalidade
         df.at[i, "Horario_Treino"] = horario
@@ -261,7 +283,7 @@ def excluir_aluno(id_aluno: int):
 def obter_aniversariantes(df: pd.DataFrame):
     """RF03: Separa os aniversariantes de HOJE e dos PRÓXIMOS 7 DIAS."""
     hoje = datetime.now().date()
-    proximos_dias = {( (hoje + timedelta(days=i)).day, (hoje + timedelta(days=i)).month ) for i in range(1, 7)}
+    proximos_dias = {((hoje + timedelta(days=i)).day, (hoje + timedelta(days=i)).month) for i in range(1, 7)}
 
     df_ativos = df[(df["Status"] == "Ativo") & (df["Data_Nasc_DT"].notna())].copy()
     df_ativos["Dia_Mes"] = df_ativos["Data_Nasc_DT"].apply(lambda d: (d.day, d.month))
@@ -334,8 +356,13 @@ def renderizar_painel_gestor():
         else:
             for _, row in aniv_hoje.iterrows():
                 tel = re.sub(r"\D", "", str(row["Contato_WhatsApp"]))
-                msg_wpp = f"Olá {row['Nome_Completo']}, Olá, [Nome]! Tudo bem? 🌊☀️ Hoje o dia é todo seu! Toda a equipe da Mais Vida Praia passa por aqui para te desejar um Feliz Aniversário! 🎉 Que este novo ciclo seja repleto de muita saúde, energia boa, momentos leves e dias iluminados. Agradecemos por fazer parte da nossa história. Aproveite muito o seu dia! 💙✨"
-                link_wpp = f"https://wa.me/55{tel}?text={html.escape(msg_wpp)}"
+                msg_wpp = (
+                    f"Olá, {row['Nome_Completo']}! Tudo bem? 🌊☀️ Hoje o dia é todo seu! "
+                    f"Toda a equipe da MaisVida Praia passa por aqui para te desejar um Feliz Aniversário! 🎉 "
+                    f"Que este novo ciclo seja repleto de muita saúde, energia boa e ótimos treinos de {row['Modalidade']}. "
+                    f"Agradecemos por fazer parte da nossa história. Aproveite muito o seu dia! 💙✨"
+                )
+                link_wpp = f"https://wa.me/55{tel}?text={quote(msg_wpp)}"
                 st.markdown(
                     f"""
                     <div class="crm-card-hoje" role="alert" tabindex="0">
@@ -403,7 +430,7 @@ def renderizar_painel_gestor():
             else df_ativos[df_ativos["Modalidade"] == filtro_mod_dash]
         )
 
-        col_g1, col_g2 = st.columns(2)
+        col_g1, col_g2, col_g3 = st.columns(3)
 
         with col_g1:
             st.subheader("⏰ Quais Horários Estão Mais Cheios?")
@@ -427,6 +454,17 @@ def renderizar_painel_gestor():
             )
             ocupacao_vinculo.columns = ["Vínculo", "Total"]
             st.bar_chart(ocupacao_vinculo.set_index("Vínculo"), y="Total", color="#047857", height=300)
+
+        with col_g3:
+            st.subheader("🏐 Alunos por Modalidade (RF04)")
+            st.caption("Volume total de alunos ativos por esporte (ordenado).")
+            ocupacao_mod = (
+                df_ativos["Modalidade"]
+                .value_counts()
+                .reset_index()
+            )
+            ocupacao_mod.columns = ["Modalidade", "Total"]
+            st.bar_chart(ocupacao_mod.set_index("Modalidade"), y="Total", color="#D97706", height=300)
 
         st.subheader("🏐 Mapa Cruzado de Lotação: Horário x Modalidade (Tabela Acessível — RNF04)")
         matriz_turmas = pd.crosstab(
@@ -484,7 +522,7 @@ def renderizar_painel_gestor():
             st.markdown("### ➕ Cadastrar Novo Aluno (Create)")
             with st.form("form_crud_create", clear_on_submit=True):
                 c_nome = st.text_input("Nome Completo *", placeholder="Ex: Rodrigo Santana")
-                c_nasc = st.text_input("Data de Nascimento (DD/MM/AAAA) *", placeholder="Ex: 20/11/1993")
+                c_nasc = st.text_input("Data de Nascimento (DD/MM/AAAA) *", placeholder="Ex: 20/11/1993 ou 20111993")
                 c_wpp = st.text_input("Contato WhatsApp (com DDD) *", placeholder="Ex: 21988887777")
                 c_mod = st.selectbox("Modalidade *", MODALIDADES)
                 c_hor = st.selectbox("Horário de Treino *", HORARIOS)
@@ -509,7 +547,7 @@ def renderizar_painel_gestor():
                 axis=1,
             ).tolist()
 
-            aluno_selecionado_str = st.selectbox("Selecione o Aluno para Editar ou Excluir:", opcoes_alunos)
+            aluno_selecionado_str = st.selectbox("Selecione o Aluno para Editar ou Excluir (digite para buscar):", opcoes_alunos)
 
             if aluno_selecionado_str:
                 id_sel = int(aluno_selecionado_str.split(" - ")[0].replace("#", ""))
@@ -583,7 +621,7 @@ def renderizar_formulario_mobile_aluno():
     # TELA 1: FORMULÁRIO MOBILE DE ENTRADA
     with st.form("form_mobile_aluno"):
         nome = st.text_input("Nome Completo *", placeholder="Ex: João da Silva")
-        data_nasc = st.text_input("Data de Nascimento (DD/MM/AAAA) *", placeholder="Ex: 15/11/1995")
+        data_nasc = st.text_input("Data de Nascimento (DD/MM/AAAA) *", placeholder="Ex: 15/11/1995 ou 15111995")
         whatsapp = st.text_input("Celular / WhatsApp (com DDD) *", placeholder="Ex: 21999998888")
         modalidade = st.selectbox("Qual modalidade você treina? *", MODALIDADES)
         horario = st.selectbox("Qual o seu horário principal de treino? *", HORARIOS)
