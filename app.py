@@ -1,15 +1,17 @@
-# MVP CRM MaisVida Praia - Versão de Homologação v1.1
+# Sistema CRM MaisVida Praia - Versão Oficial de Produção (Persistência Bidirecional Google Sheets)
 
 import html
 import os
 import re
 from datetime import datetime, timedelta
+from urllib.parse import quote
 import bcrypt
+import gspread
 import pandas as pd
 import streamlit as st
 
 # ==============================================================================
-# CONFIGURAÇÃO DA PÁGINA E ACESSIBILIDADE (RNF04 - WCAG AA & 44x44px)
+# CONFIGURAÇÃO DA PÁGINA E ACESSIBILIDADE (WCAG AA & 44x44px)
 # ==============================================================================
 st.set_page_config(
     page_title="CRM & Gestão de Alunos — MaisVida Praia",
@@ -21,7 +23,6 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-        /* RNF04: Alto contraste (>= 4.5:1), áreas de toque mínimas de 44x44px e Foco Visível */
         .stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {
             min-height: 48px !important;
             min-width: 48px !important;
@@ -67,22 +68,32 @@ MODALIDADES = ["Futevôlei", "Vôlei de Praia", "Funcional"]
 HORARIOS = ["06:00", "07:00", "08:00", "09:00", "17:00", "18:00", "19:00", "20:00"]
 VINCULOS = ["Mensalista", "Gympass", "Totalpass", "Aula Experimental"]
 STATUS_OPCOES = ["Ativo", "Inativo"]
-ARQUIVO_BANCO = "alunos_maisvida.csv"
+ARQUIVO_BANCO_FALLBACK = "alunos_maisvida_producao.csv"
+
+COLUNAS_PADRAO = [
+    "ID_Aluno",
+    "Data_Cadastro",
+    "Nome_Completo",
+    "Data_Nascimento",
+    "Contato_WhatsApp",
+    "Modalidade",
+    "Horario_Treino",
+    "Tipo_Vinculo",
+    "Status",
+]
 
 
 # ==============================================================================
-# SEGURANÇA, HASH BCRYPT E SANITIZAÇÃO OWASP (RNF01 & RNF02)
+# SEGURANÇA, HASH BCRYPT E SANITIZAÇÃO OWASP
 # ==============================================================================
 def obter_hash_gestor() -> bytes:
     try:
         senha_cfg = st.secrets["credentials"]["usernames"]["gestor"]["password"].strip()
-        # Se tiver um hash Bcrypt real (e não o exemplo K8H9p3x...), usa ele
-        if senha_cfg.startswith("$2b$") and not senha_cfg.startswith("$2b$12$K8H9p3x"):
+        if senha_cfg.startswith("$2b$"):
             return senha_cfg.encode("utf-8")
     except Exception:
         pass
 
-    # Gera um hash Bcrypt real em memória para a senha padrão: MaisVida2026!
     if "fallback_bcrypt_hash" not in st.session_state:
         st.session_state["fallback_bcrypt_hash"] = bcrypt.hashpw(
             b"MaisVida2026!", bcrypt.gensalt(rounds=12)
@@ -112,134 +123,150 @@ def autenticar_gestor(usuario: str, senha: str) -> bool:
 
 
 def sanitizar_xss(valor: str) -> str:
-    """RNF02: Codifica caracteres HTML/JS para impedir Cross-Site Scripting (XSS)."""
     if pd.isna(valor):
         return ""
     return html.escape(str(valor).strip(), quote=True)
 
 
+def normalizar_data_nascimento(data_str: str) -> str:
+    limpo = str(data_str).strip()
+    apenas_digitos = re.sub(r"\D", "", limpo)
+    if len(apenas_digitos) == 8:
+        return f"{apenas_digitos[:2]}/{apenas_digitos[2:4]}/{apenas_digitos[4:]}"
+    return re.sub(r"[-.]", "/", limpo)
+
+
 def validar_dados_aluno(nome: str, data_nasc: str, whatsapp: str) -> list[str]:
-    """RF01: Valida campos obrigatórios e formato estrito de calendário DD/MM/AAAA."""
     erros = []
     if not nome or not nome.strip():
-        erros.append("⚠️ [ERRO RF01] O 'Nome Completo' é obrigatório.")
-    if not re.match(r"^\d{2}/\d{2}/\d{4}$", str(data_nasc).strip()):
-        erros.append("⚠️ [ERRO RF01] 'Data de Nascimento' deve estar no formato DD/MM/AAAA.")
+        erros.append("⚠️ O 'Nome Completo' é obrigatório.")
+
+    data_norm = normalizar_data_nascimento(data_nasc)
+    if not re.match(r"^\d{2}/\d{2}/\d{4}$", data_norm):
+        erros.append("⚠️ 'Data de Nascimento' deve estar no formato DD/MM/AAAA.")
     else:
         try:
-            dt = datetime.strptime(str(data_nasc).strip(), "%d/%m/%Y")
+            dt = datetime.strptime(data_norm, "%d/%m/%Y")
             if dt > datetime.now() or dt.year < 1920:
-                erros.append("⚠️ [ERRO RF01] Data de Nascimento inválida ou no futuro.")
+                erros.append("⚠️ Data de Nascimento inválida ou no futuro.")
         except ValueError:
-            erros.append("⚠️ [ERRO RF01] Data inexistente no calendário (ex: 32/13/1990).")
+            erros.append("⚠️ Data inexistente no calendário (ex: 32/13/1990).")
 
     apenas_numeros = re.sub(r"\D", "", str(whatsapp))
     if len(apenas_numeros) < 10:
-        erros.append("⚠️ [ERRO RF01] Informe um WhatsApp válido com DDD (mínimo 10 dígitos).")
+        erros.append("⚠️ Informe um WhatsApp válido com DDD (mínimo 10 dígitos).")
     return erros
 
 
 # ==============================================================================
-# PERSISTÊNCIA E OPERAÇÕES CRUD NO BANCO DE DADOS (CREATE, READ, UPDATE, DELETE)
+# PERSISTÊNCIA BIDIRECIONAL NO GOOGLE SHEETS VIA GSPREAD
 # ==============================================================================
-
-@st.cache_data(ttl=30, show_spinner=False)
-def ler_banco_alunos() -> pd.DataFrame:
-    """READ: Carrega a base local (CRUD) e sincroniza novas respostas do Google Forms."""
-    if not os.path.exists(ARQUIVO_BANCO):
-        from seed_data import gerar_base_alunos
-        gerar_base_alunos(ARQUIVO_BANCO)
-
-    df = pd.read_csv(ARQUIVO_BANCO, dtype=str)
-
-    # Se você colou o link CSV publicado no secrets.toml, puxa as respostas do Forms
-    url_sheets = ""
+@st.cache_resource(show_spinner=False)
+def conectar_planilha_google():
+    """Mantém a conexão autenticada com a planilha do Google Sheets."""
     try:
-        url_sheets = st.secrets.get("sheets_csv_url", "")
-    except Exception:
-        url_sheets = ""
+        if "gcp_service_account" in st.secrets and "sheet_id" in st.secrets:
+            credenciais = dict(st.secrets["gcp_service_account"])
+            gc = gspread.service_account_from_dict(credenciais)
+            planilha = gc.open_by_key(st.secrets["sheet_id"])
+            aba = planilha.sheet1
+            if not aba.row_values(1):
+                aba.append_row(COLUNAS_PADRAO)
+            return aba
+    except Exception as e:
+        st.session_state["erro_nuvem"] = str(e)
+    return None
 
-    if url_sheets:
+
+@st.cache_data(ttl=20, show_spinner=False)
+def ler_banco_alunos() -> pd.DataFrame:
+    """READ: Lê os alunos diretamente da Planilha Google Sheets."""
+    aba = conectar_planilha_google()
+    df = None
+
+    if aba is not None:
         try:
-            df_forms = pd.read_csv(url_sheets, dtype=str)
-            # Renomeia na ordem das colunas do seu Google Forms
-            colunas_forms = [
-                "Data_Cadastro", "Nome_Completo", "Data_Nascimento",
-                "Contato_WhatsApp", "Modalidade", "Horario_Treino", "Tipo_Vinculo"
-            ]
-            if len(df_forms.columns) >= 7:
-                df_forms = df_forms.iloc[:, :7]
-                df_forms.columns = colunas_forms
-                df_forms["Status"] = "Ativo"
-
-                # Adiciona apenas quem ainda não foi importado para o banco local
-                ja_cadastrados = set(df["Data_Cadastro"].dropna())
-                novos = df_forms[~df_forms["Data_Cadastro"].isin(ja_cadastrados)].copy()
-
-                if not novos.empty:
-                    max_id = pd.to_numeric(df["ID_Aluno"], errors="coerce").fillna(0).max()
-                    novos["ID_Aluno"] = range(int(max_id) + 1, int(max_id) + 1 + len(novos))
-                    df = pd.concat([df, novos], ignore_index=True)
-                    salvar_banco_alunos(df)
+            valores = aba.get_all_values()
+            if len(valores) > 1:
+                df = pd.DataFrame(valores[1:], columns=valores[0], dtype=str)
+            else:
+                df = pd.DataFrame(columns=COLUNAS_PADRAO)
         except Exception:
-            pass
+            df = None
+
+    if df is None:
+        if not os.path.exists(ARQUIVO_BANCO_FALLBACK):
+            pd.DataFrame(columns=COLUNAS_PADRAO).to_csv(ARQUIVO_BANCO_FALLBACK, index=False, encoding="utf-8")
+        df = pd.read_csv(ARQUIVO_BANCO_FALLBACK, dtype=str)
+
+    for col in COLUNAS_PADRAO:
+        if col not in df.columns:
+            df[col] = pd.Series(dtype="str")
+
+    if df.empty:
+        df["ID_Aluno"] = pd.Series(dtype="int")
+        df["Data_Nasc_DT"] = pd.Series(dtype="datetime64[ns]")
+        return df
 
     df["ID_Aluno"] = pd.to_numeric(df["ID_Aluno"], errors="coerce").fillna(0).astype(int)
     df["Nome_Completo"] = df["Nome_Completo"].apply(sanitizar_xss)
     df["Contato_WhatsApp"] = df["Contato_WhatsApp"].apply(sanitizar_xss)
-    df["Data_Nasc_DT"] = pd.to_datetime(
-        df["Data_Nascimento"], format="%d/%m/%Y", errors="coerce"
-    )
+    df["Data_Nasc_DT"] = pd.to_datetime(df["Data_Nascimento"], format="%d/%m/%Y", errors="coerce")
     return df
 
 
 def salvar_banco_alunos(df: pd.DataFrame):
-    """Persiste alterações de Create, Update ou Delete e limpa o cache."""
-    colunas_persistidas = [
-        "ID_Aluno",
-        "Data_Cadastro",
-        "Nome_Completo",
-        "Data_Nascimento",
-        "Contato_WhatsApp",
-        "Modalidade",
-        "Horario_Treino",
-        "Tipo_Vinculo",
-        "Status",
-    ]
-    df[colunas_persistidas].to_csv(ARQUIVO_BANCO, index=False, encoding="utf-8")
+    """Sincroniza o DataFrame completo com o Google Sheets (Update/Delete)."""
+    df_salvar = df[COLUNAS_PADRAO].fillna("").astype(str)
+    aba = conectar_planilha_google()
+    if aba is not None:
+        aba.clear()
+        aba.update([COLUNAS_PADRAO] + df_salvar.values.tolist())
+    df_salvar.to_csv(ARQUIVO_BANCO_FALLBACK, index=False, encoding="utf-8")
     st.cache_data.clear()
 
 
 def criar_aluno(nome: str, data_nasc: str, whatsapp: str, modalidade: str, horario: str, vinculo: str):
-    """CREATE: Insere um novo aluno no banco com Timestamp automático (RF02)."""
+    """CREATE: Adiciona uma nova linha diretamente no Google Sheets."""
     df = ler_banco_alunos()
     novo_id = int(df["ID_Aluno"].max()) + 1 if not df.empty else 1
     timestamp_servidor = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    data_formatada = normalizar_data_nascimento(data_nasc)
+    wpp_limpo = re.sub(r"\D", "", whatsapp)
+    nome_seguro = sanitizar_xss(nome)
 
-    novo_registro = pd.DataFrame([{
-        "ID_Aluno": novo_id,
-        "Data_Cadastro": timestamp_servidor,
-        "Nome_Completo": sanitizar_xss(nome),
-        "Data_Nascimento": data_nasc.strip(),
-        "Contato_WhatsApp": re.sub(r"\D", "", whatsapp),
-        "Modalidade": modalidade,
-        "Horario_Treino": horario,
-        "Tipo_Vinculo": vinculo,
-        "Status": "Ativo",
-    }])
-    df_atualizado = pd.concat([df, novo_registro], ignore_index=True)
-    salvar_banco_alunos(df_atualizado)
+    nova_linha = [
+        str(novo_id),
+        timestamp_servidor,
+        nome_seguro,
+        data_formatada,
+        wpp_limpo,
+        modalidade,
+        horario,
+        vinculo,
+        "Ativo",
+    ]
+
+    aba = conectar_planilha_google()
+    if aba is not None:
+        aba.append_row(nova_linha)
+        st.cache_data.clear()
+    else:
+        novo_reg = pd.DataFrame([dict(zip(COLUNAS_PADRAO, nova_linha))])
+        df_atualizado = pd.concat([df, novo_reg], ignore_index=True)
+        salvar_banco_alunos(df_atualizado)
+
     return timestamp_servidor
 
 
 def atualizar_aluno(id_aluno: int, nome: str, data_nasc: str, whatsapp: str, modalidade: str, horario: str, vinculo: str, status: str):
-    """UPDATE: Atualiza os dados cadastrais, horário ou vínculo de um aluno existente."""
+    """UPDATE: Edita o registro do aluno e atualiza a Planilha Google."""
     df = ler_banco_alunos()
     idx = df.index[df["ID_Aluno"] == id_aluno]
     if len(idx) > 0:
         i = idx[0]
         df.at[i, "Nome_Completo"] = sanitizar_xss(nome)
-        df.at[i, "Data_Nascimento"] = data_nasc.strip()
+        df.at[i, "Data_Nascimento"] = normalizar_data_nascimento(data_nasc)
         df.at[i, "Contato_WhatsApp"] = re.sub(r"\D", "", whatsapp)
         df.at[i, "Modalidade"] = modalidade
         df.at[i, "Horario_Treino"] = horario
@@ -249,21 +276,26 @@ def atualizar_aluno(id_aluno: int, nome: str, data_nasc: str, whatsapp: str, mod
 
 
 def excluir_aluno(id_aluno: int):
-    """DELETE: Remove o registro do aluno (Direito ao esquecimento LGPD / Gestão)."""
+    """DELETE: Remove o aluno e atualiza a Planilha Google."""
     df = ler_banco_alunos()
     df_filtrado = df[df["ID_Aluno"] != id_aluno].copy()
     salvar_banco_alunos(df_filtrado)
 
 
 # ==============================================================================
-# REGRAS DE NEGÓCIO DO CRM (ANIVERSARIANTES DO DIA/SEMANA E LOTAÇÃO DE HORÁRIOS)
+# REGRAS DE NEGÓCIO DO CRM (ANIVERSARIANTES)
 # ==============================================================================
 def obter_aniversariantes(df: pd.DataFrame):
-    """RF03: Separa os aniversariantes de HOJE e dos PRÓXIMOS 7 DIAS."""
+    if df.empty:
+        return df.copy(), df.copy()
+
     hoje = datetime.now().date()
-    proximos_dias = {( (hoje + timedelta(days=i)).day, (hoje + timedelta(days=i)).month ) for i in range(1, 7)}
+    proximos_dias = {((hoje + timedelta(days=i)).day, (hoje + timedelta(days=i)).month) for i in range(1, 7)}
 
     df_ativos = df[(df["Status"] == "Ativo") & (df["Data_Nasc_DT"].notna())].copy()
+    if df_ativos.empty:
+        return df_ativos.copy(), df_ativos.copy()
+
     df_ativos["Dia_Mes"] = df_ativos["Data_Nasc_DT"].apply(lambda d: (d.day, d.month))
     df_ativos["Dia_Mes_Str"] = df_ativos["Data_Nasc_DT"].dt.strftime("%d/%m")
 
@@ -273,11 +305,11 @@ def obter_aniversariantes(df: pd.DataFrame):
 
 
 # ==============================================================================
-# TELA DE LOGIN DO GESTOR (RNF01)
+# TELAS DO SISTEMA
 # ==============================================================================
 def renderizar_login():
     st.markdown("## 🔒 Acesso Restrito — CRM MaisVida Praia")
-    st.caption("Autenticação protegida por algoritmo Bcrypt (RNF01 / OWASP A01:2021).")
+    st.caption("Área exclusiva para a administração e recepção da MaisVida Praia.")
 
     if st.session_state.get("tentativas_login", 0) >= 5:
         st.error("⛔ Acesso bloqueado temporariamente por excesso de tentativas.")
@@ -287,7 +319,7 @@ def renderizar_login():
     with col2:
         with st.form("form_login"):
             st.markdown("### Login da Recepção / Gestão")
-            usuario = st.text_input("Usuário", placeholder="Ex: gestor")
+            usuario = st.text_input("Usuário", placeholder="Digite seu usuário")
             senha = st.text_input("Senha", type="password", placeholder="Digite sua senha")
             entrar = st.form_submit_button("Acessar Painel CRM", use_container_width=True)
 
@@ -299,31 +331,26 @@ def renderizar_login():
                 else:
                     st.error("⚠️ Usuário ou senha incorretos.")
 
-        st.info("💡 **Acesso para avaliação:** Usuário: `gestor` | Senha: `MaisVida2026!`")
 
-
-# ==============================================================================
-# PAINEL GERENCIAL PRINCIPAL (DASHBOARD + CRUD COMPLETO)
-# ==============================================================================
 def renderizar_painel_gestor():
-    col_t, col_u, col_s = st.columns([4, 1.5, 1])
+    aba_conectada = conectar_planilha_google() is not None
+    status_nuvem = "🟢 Google Sheets Conectado" if aba_conectada else "🟡 Modo Local (Configure o Secrets)"
+
+    col_t, col_u, col_s = st.columns([3.8, 1.7, 1])
     with col_t:
         st.title("🏖️ CRM & Controle de Alunos — MaisVida Praia")
         st.caption("Gestão de horários de treino, vínculos (Mensalista / Gympass / Totalpass / Experimental) e aniversariantes")
     with col_u:
-        st.markdown(f"**Operador:**\n`{st.session_state.get('usuario_logado')}`")
+        st.markdown(f"**Operador:** `{st.session_state.get('usuario_logado')}`\n\n**Banco:** `{status_nuvem}`")
     with col_s:
         if st.button("🚪 Sair", use_container_width=True):
             st.session_state.clear()
             st.rerun()
 
     df = ler_banco_alunos()
-    df_ativos = df[df["Status"] == "Ativo"].copy()
+    df_ativos = df[df["Status"] == "Ativo"].copy() if not df.empty else df.copy()
     aniv_hoje, aniv_semana = obter_aniversariantes(df)
 
-    # --------------------------------------------------------------------------
-    # SIDEBAR: ALERTAS DE ANIVERSARIANTES DO DIA E DA SEMANA + WHATSAPP (RF03)
-    # --------------------------------------------------------------------------
     with st.sidebar:
         st.header("🎂 Radar de Aniversariantes")
         st.caption("Clique no WhatsApp para parabenizar o aluno")
@@ -334,8 +361,13 @@ def renderizar_painel_gestor():
         else:
             for _, row in aniv_hoje.iterrows():
                 tel = re.sub(r"\D", "", str(row["Contato_WhatsApp"]))
-                msg_wpp = f"Olá {row['Nome_Completo']}, Olá, [Nome]! Tudo bem? 🌊☀️ Hoje o dia é todo seu! Toda a equipe da Mais Vida Praia passa por aqui para te desejar um Feliz Aniversário! 🎉 Que este novo ciclo seja repleto de muita saúde, energia boa, momentos leves e dias iluminados. Agradecemos por fazer parte da nossa história. Aproveite muito o seu dia! 💙✨"
-                link_wpp = f"https://wa.me/55{tel}?text={html.escape(msg_wpp)}"
+                msg_wpp = (
+                    f"Olá, {row['Nome_Completo']}! Tudo bem? 🌊☀️ Hoje o dia é todo seu! "
+                    f"Toda a equipe da MaisVida Praia passa por aqui para te desejar um Feliz Aniversário! 🎉 "
+                    f"Que este novo ciclo seja repleto de muita saúde, energia boa e ótimos treinos de {row['Modalidade']}. "
+                    f"Aproveite muito o seu dia! 💙✨"
+                )
+                link_wpp = f"https://wa.me/55{tel}?text={quote(msg_wpp)}"
                 st.markdown(
                     f"""
                     <div class="crm-card-hoje" role="alert" tabindex="0">
@@ -368,21 +400,16 @@ def renderizar_painel_gestor():
                     unsafe_allow_html=True,
                 )
 
-    # --------------------------------------------------------------------------
-    # ABAS DO SISTEMA: 1) DASHBOARD DE OCUPAÇÃO | 2) CRUD COMPLETO DE ALUNOS
-    # --------------------------------------------------------------------------
     aba_dash, aba_crud = st.tabs([
         "📊 Visão Geral: Horários Mais Cheios & Planos",
         "🛠️ Gerenciar Alunos (CRUD: Cadastrar, Editar e Excluir)"
     ])
 
-    # === ABA 1: DASHBOARD DE HORÁRIOS, MODALIDADES E VÍNCULOS ===
     with aba_dash:
-        # KPIs no Topo
         c1, c2, c3, c4, c5 = st.columns(5)
-        qtd_mensalistas = len(df_ativos[df_ativos["Tipo_Vinculo"] == "Mensalista"])
-        qtd_gympass = len(df_ativos[df_ativos["Tipo_Vinculo"].isin(["Gympass", "Totalpass"])])
-        qtd_exp = len(df_ativos[df_ativos["Tipo_Vinculo"] == "Aula Experimental"])
+        qtd_mensalistas = len(df_ativos[df_ativos["Tipo_Vinculo"] == "Mensalista"]) if not df_ativos.empty else 0
+        qtd_gympass = len(df_ativos[df_ativos["Tipo_Vinculo"].isin(["Gympass", "Totalpass"])]) if not df_ativos.empty else 0
+        qtd_exp = len(df_ativos[df_ativos["Tipo_Vinculo"] == "Aula Experimental"]) if not df_ativos.empty else 0
 
         c1.metric("👥 Alunos Ativos", len(df_ativos))
         c2.metric("🏅 Mensalistas", qtd_mensalistas)
@@ -392,54 +419,64 @@ def renderizar_painel_gestor():
 
         st.divider()
 
-        # Filtro rápido por modalidade para ver horários mais cheios
-        filtro_mod_dash = st.selectbox(
-            "🔍 Filtrar análise de horários por Modalidade Esportiva:",
-            options=["Todas as Modalidades"] + MODALIDADES,
-        )
-        df_dash = (
-            df_ativos
-            if filtro_mod_dash == "Todas as Modalidades"
-            else df_ativos[df_ativos["Modalidade"] == filtro_mod_dash]
-        )
-
-        col_g1, col_g2 = st.columns(2)
-
-        with col_g1:
-            st.subheader("⏰ Quais Horários Estão Mais Cheios?")
-            st.caption("Quantidade de alunos cadastrados por horário de treino.")
-            ocupacao_horario = (
-                df_dash["Horario_Treino"]
-                .value_counts()
-                .reindex(HORARIOS, fill_value=0)
-                .reset_index()
+        if df_ativos.empty:
+            st.info("📭 O banco de dados está limpo e pronto para operação! Utilize o QR Code do balcão ou a aba 'Gerenciar Alunos' para registrar o primeiro aluno.")
+        else:
+            filtro_mod_dash = st.selectbox(
+                "🔍 Filtrar análise de horários por Modalidade Esportiva:",
+                options=["Todas as Modalidades"] + MODALIDADES,
             )
-            ocupacao_horario.columns = ["Horário", "Alunos"]
-            st.bar_chart(ocupacao_horario.set_index("Horário"), y="Alunos", color="#005A9C", height=300)
-
-        with col_g2:
-            st.subheader("🏷️ Alunos por Tipo de Vínculo / Plano")
-            st.caption("Distribuição entre Mensalistas, Gympass, Totalpass e Experimentais.")
-            ocupacao_vinculo = (
-                df_dash["Tipo_Vinculo"]
-                .value_counts()
-                .reset_index()
+            df_dash = (
+                df_ativos
+                if filtro_mod_dash == "Todas as Modalidades"
+                else df_ativos[df_ativos["Modalidade"] == filtro_mod_dash]
             )
-            ocupacao_vinculo.columns = ["Vínculo", "Total"]
-            st.bar_chart(ocupacao_vinculo.set_index("Vínculo"), y="Total", color="#047857", height=300)
 
-        st.subheader("🏐 Mapa Cruzado de Lotação: Horário x Modalidade (Tabela Acessível — RNF04)")
-        matriz_turmas = pd.crosstab(
-            df_ativos["Horario_Treino"],
-            df_ativos["Modalidade"],
-            margins=True,
-            margins_name="Total no Horário",
-        )
-        st.dataframe(matriz_turmas, use_container_width=True)
+            col_g1, col_g2 = st.columns(2)
+            with col_g1:
+                st.subheader("⏰ Quais Horários Estão Mais Cheios?")
+                ocupacao_horario = (
+                    df_dash["Horario_Treino"]
+                    .value_counts()
+                    .reindex(HORARIOS, fill_value=0)
+                    .reset_index()
+                )
+                ocupacao_horario.columns = ["Horário", "Alunos"]
+                st.bar_chart(ocupacao_horario.set_index("Horário"), y="Alunos", color="#005A9C", height=300)
 
-    # === ABA 2: CRUD COMPLETO (CREATE, READ, UPDATE, DELETE) ===
+            with col_g2:
+                st.subheader("🏷️ Alunos por Tipo de Vínculo / Plano")
+                ocupacao_vinculo = (
+                    df_dash["Tipo_Vinculo"]
+                    .value_counts()
+                    .reindex(VINCULOS, fill_value=0)
+                    .reset_index()
+                )
+                ocupacao_vinculo.columns = ["Vínculo", "Total"]
+                st.bar_chart(ocupacao_vinculo.set_index("Vínculo"), y="Total", color="#047857", height=300)
+
+            st.subheader("🏐 Mapa Cruzado de Lotação: Horário x Modalidade")
+            matriz_turmas = pd.crosstab(
+                df_ativos["Horario_Treino"],
+                df_ativos["Modalidade"],
+                margins=True,
+                margins_name="Total no Horário",
+            )
+            st.dataframe(matriz_turmas, use_container_width=True)
+
     with aba_crud:
-        st.subheader("📋 Base de Alunos Cadastrados (Consulta e Filtros — READ)")
+        col_tit_crud, col_dl_crud = st.columns([3, 1])
+        with col_tit_crud:
+            st.subheader("📋 Base de Alunos Cadastrados (Consulta e Filtros — READ)")
+        with col_dl_crud:
+            csv_bytes = df[COLUNAS_PADRAO].to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+            st.download_button(
+                "📥 Baixar Planilha (Excel/CSV)",
+                data=csv_bytes,
+                file_name=f"alunos_maisvida_{datetime.now().strftime('%d_%m_%Y')}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
         f_col1, f_col2, f_col3, f_col4 = st.columns(4)
         with f_col1:
@@ -452,25 +489,26 @@ def renderizar_painel_gestor():
             filtro_hor = st.selectbox("Filtrar por Horário:", ["Todos"] + HORARIOS)
 
         df_consulta = df.copy()
-        if busca_nome.strip():
-            termo = busca_nome.strip().lower()
-            df_consulta = df_consulta[
-                df_consulta["Nome_Completo"].str.lower().str.contains(termo, na=False)
-                | df_consulta["Contato_WhatsApp"].str.contains(termo, na=False)
-            ]
-        if filtro_vinc != "Todos":
-            df_consulta = df_consulta[df_consulta["Tipo_Vinculo"] == filtro_vinc]
-        if filtro_mod != "Todas":
-            df_consulta = df_consulta[df_consulta["Modalidade"] == filtro_mod]
-        if filtro_hor != "Todos":
-            df_consulta = df_consulta[df_consulta["Horario_Treino"] == filtro_hor]
+        if not df_consulta.empty:
+            if busca_nome.strip():
+                termo = busca_nome.strip().lower()
+                df_consulta = df_consulta[
+                    df_consulta["Nome_Completo"].str.lower().str.contains(termo, na=False)
+                    | df_consulta["Contato_WhatsApp"].str.contains(termo, na=False)
+                ]
+            if filtro_vinc != "Todos":
+                df_consulta = df_consulta[df_consulta["Tipo_Vinculo"] == filtro_vinc]
+            if filtro_mod != "Todas":
+                df_consulta = df_consulta[df_consulta["Modalidade"] == filtro_mod]
+            if filtro_hor != "Todos":
+                df_consulta = df_consulta[df_consulta["Horario_Treino"] == filtro_hor]
 
         colunas_visiveis = [
             "ID_Aluno", "Nome_Completo", "Data_Nascimento", "Contato_WhatsApp",
             "Modalidade", "Horario_Treino", "Tipo_Vinculo", "Status", "Data_Cadastro"
         ]
         st.dataframe(
-            df_consulta[colunas_visiveis].sort_values(by="ID_Aluno", ascending=False),
+            df_consulta[colunas_visiveis].sort_values(by="ID_Aluno", ascending=False) if not df_consulta.empty else df_consulta[colunas_visiveis],
             hide_index=True,
             use_container_width=True,
             height=280,
@@ -479,7 +517,6 @@ def renderizar_painel_gestor():
         st.divider()
         col_create, col_update_delete = st.columns(2)
 
-        # --- OPERAÇÃO CREATE (CADASTRAR NOVO ALUNO MANUALMENTE NA RECEPÇÃO) ---
         with col_create:
             st.markdown("### ➕ Cadastrar Novo Aluno (Create)")
             with st.form("form_crud_create", clear_on_submit=True):
@@ -498,89 +535,86 @@ def renderizar_painel_gestor():
                             st.error(e)
                     else:
                         ts = criar_aluno(c_nome, c_nasc, c_wpp, c_mod, c_hor, c_vinc)
-                        st.success(f"✔️ Aluno '{c_nome}' cadastrado com sucesso às {ts}!")
+                        st.success(f"✔️ Aluno '{c_nome}' salvo na planilha às {ts}!")
                         st.rerun()
 
-        # --- OPERAÇÕES UPDATE & DELETE (EDITAR HORÁRIO/PLANO OU EXCLUIR ALUNO) ---
         with col_update_delete:
             st.markdown("### ✏️ Atualizar ou Excluir Aluno (Update / Delete)")
-            opcoes_alunos = df.sort_values(by="ID_Aluno", ascending=False).apply(
-                lambda r: f"#{r['ID_Aluno']} - {r['Nome_Completo']} ({r['Modalidade']} {r['Horario_Treino']} | {r['Tipo_Vinculo']})",
-                axis=1,
-            ).tolist()
+            if df.empty:
+                st.info("Nenhum aluno cadastrado para editar ou excluir.")
+            else:
+                opcoes_alunos = df.sort_values(by="ID_Aluno", ascending=False).apply(
+                    lambda r: f"#{r['ID_Aluno']} - {r['Nome_Completo']} ({r['Modalidade']} {r['Horario_Treino']} | {r['Tipo_Vinculo']})",
+                    axis=1,
+                ).tolist()
 
-            aluno_selecionado_str = st.selectbox("Selecione o Aluno para Editar ou Excluir:", opcoes_alunos)
+                aluno_selecionado_str = st.selectbox("Selecione o Aluno para Editar ou Excluir:", opcoes_alunos)
 
-            if aluno_selecionado_str:
-                id_sel = int(aluno_selecionado_str.split(" - ")[0].replace("#", ""))
-                registro_atual = df[df["ID_Aluno"] == id_sel].iloc[0]
+                if aluno_selecionado_str:
+                    id_sel = int(aluno_selecionado_str.split(" - ")[0].replace("#", ""))
+                    registro_atual = df[df["ID_Aluno"] == id_sel].iloc[0]
 
-                with st.form("form_crud_update"):
-                    u_nome = st.text_input("Nome Completo *", value=registro_atual["Nome_Completo"])
-                    u_nasc = st.text_input("Data de Nascimento (DD/MM/AAAA) *", value=registro_atual["Data_Nascimento"])
-                    u_wpp = st.text_input("Contato WhatsApp *", value=registro_atual["Contato_WhatsApp"])
-                    u_mod = st.selectbox(
-                        "Modalidade *",
-                        MODALIDADES,
-                        index=MODALIDADES.index(registro_atual["Modalidade"]) if registro_atual["Modalidade"] in MODALIDADES else 0,
-                    )
-                    u_hor = st.selectbox(
-                        "Horário de Treino *",
-                        HORARIOS,
-                        index=HORARIOS.index(registro_atual["Horario_Treino"]) if registro_atual["Horario_Treino"] in HORARIOS else 0,
-                    )
-                    u_vinc = st.selectbox(
-                        "Tipo de Vínculo *",
-                        VINCULOS,
-                        index=VINCULOS.index(registro_atual["Tipo_Vinculo"]) if registro_atual["Tipo_Vinculo"] in VINCULOS else 0,
-                    )
-                    u_status = st.selectbox(
-                        "Status do Cadastro *",
-                        STATUS_OPCOES,
-                        index=STATUS_OPCOES.index(registro_atual["Status"]) if registro_atual["Status"] in STATUS_OPCOES else 0,
-                    )
+                    with st.form("form_crud_update"):
+                        u_nome = st.text_input("Nome Completo *", value=registro_atual["Nome_Completo"])
+                        u_nasc = st.text_input("Data de Nascimento (DD/MM/AAAA) *", value=registro_atual["Data_Nascimento"])
+                        u_wpp = st.text_input("Contato WhatsApp *", value=registro_atual["Contato_WhatsApp"])
+                        u_mod = st.selectbox(
+                            "Modalidade *",
+                            MODALIDADES,
+                            index=MODALIDADES.index(registro_atual["Modalidade"]) if registro_atual["Modalidade"] in MODALIDADES else 0,
+                        )
+                        u_hor = st.selectbox(
+                            "Horário de Treino *",
+                            HORARIOS,
+                            index=HORARIOS.index(registro_atual["Horario_Treino"]) if registro_atual["Horario_Treino"] in HORARIOS else 0,
+                        )
+                        u_vinc = st.selectbox(
+                            "Tipo de Vínculo *",
+                            VINCULOS,
+                            index=VINCULOS.index(registro_atual["Tipo_Vinculo"]) if registro_atual["Tipo_Vinculo"] in VINCULOS else 0,
+                        )
+                        u_status = st.selectbox(
+                            "Status do Cadastro *",
+                            STATUS_OPCOES,
+                            index=STATUS_OPCOES.index(registro_atual["Status"]) if registro_atual["Status"] in STATUS_OPCOES else 0,
+                        )
 
-                    col_btn_up, col_btn_del = st.columns(2)
-                    with col_btn_up:
-                        btn_atualizar = st.form_submit_button("🔄 Atualizar Cadastro", use_container_width=True)
-                    with col_btn_del:
-                        btn_excluir = st.form_submit_button("🗑️ Excluir Aluno", use_container_width=True)
+                        col_btn_up, col_btn_del = st.columns(2)
+                        with col_btn_up:
+                            btn_atualizar = st.form_submit_button("🔄 Atualizar Cadastro", use_container_width=True)
+                        with col_btn_del:
+                            btn_excluir = st.form_submit_button("🗑️ Excluir Aluno", use_container_width=True)
 
-                    if btn_atualizar:
-                        erros = validar_dados_aluno(u_nome, u_nasc, u_wpp)
-                        if erros:
-                            for e in erros:
-                                st.error(e)
-                        else:
-                            atualizar_aluno(id_sel, u_nome, u_nasc, u_wpp, u_mod, u_hor, u_vinc, u_status)
-                            st.success(f"✔️ Cadastro #{id_sel} atualizado com sucesso!")
+                        if btn_atualizar:
+                            erros = validar_dados_aluno(u_nome, u_nasc, u_wpp)
+                            if erros:
+                                for e in erros:
+                                    st.error(e)
+                            else:
+                                atualizar_aluno(id_sel, u_nome, u_nasc, u_wpp, u_mod, u_hor, u_vinc, u_status)
+                                st.success(f"✔️ Cadastro #{id_sel} atualizado na planilha!")
+                                st.rerun()
+
+                        if btn_excluir:
+                            excluir_aluno(id_sel)
+                            st.warning(f"🗑️ Registro #{id_sel} excluído da planilha.")
                             st.rerun()
 
-                    if btn_excluir:
-                        excluir_aluno(id_sel)
-                        st.warning(f"🗑️ Registro #{id_sel} excluído permanentemente do banco.")
-                        st.rerun()
 
-
-# ==============================================================================
-# TELA 1 E TELA 2: FORMULÁRIO MOBILE DO ALUNO (AUTO-CADASTRO VIA QR CODE)
-# ==============================================================================
 def renderizar_formulario_mobile_aluno():
     st.markdown("## 📱 Auto-Cadastro Rápido de Aluno — MaisVida Praia")
-    st.caption("Os dados preenchidos aqui nos ajudarão a melhorar nosso relacionamento com você!")
+    st.caption("Preencha seus dados em poucos segundos para liberar seu treino e receber novidades!")
 
     if st.session_state.get("cadastro_enviado", False):
-        # TELA 2: CONFIRMAÇÃO DE CADASTRO
         st.success("## ✔️ Cadastro concluído com sucesso! Bom treino na areia!")
         st.markdown(
-            f"**Registro salvo no servidor em (RF02):** `{st.session_state.get('ultimo_ts_cadastro')}`"
+            f"**Registro confirmado em:** `{st.session_state.get('ultimo_ts_cadastro')}`"
         )
         if st.button("➕ Cadastrar Outro Aluno", use_container_width=True):
             st.session_state["cadastro_enviado"] = False
             st.rerun()
         return
 
-    # TELA 1: FORMULÁRIO MOBILE DE ENTRADA
     with st.form("form_mobile_aluno"):
         nome = st.text_input("Nome Completo *", placeholder="Ex: João da Silva")
         data_nasc = st.text_input("Data de Nascimento (DD/MM/AAAA) *", placeholder="Ex: 15/11/1995")
@@ -603,19 +637,20 @@ def renderizar_formulario_mobile_aluno():
                 st.rerun()
 
 
-# ==============================================================================
-# ROTEADOR PRINCIPAL
-# ==============================================================================
 def main():
+    visao_url = st.query_params.get("visao", "")
+    indice_padrao = 1 if visao_url == "aluno" else 0
+
     modo = st.sidebar.radio(
-        "🧭 Alternar Visão do MVP:",
+        "🧭 Navegação do Sistema:",
         options=[
-            "📊 Painel da Recepção / Gestor (Tela 3 + CRUD)",
-            "📱 Formulário QR Code do Aluno (Telas 1 e 2)",
+            "📊 Painel da Recepção / Gestor",
+            "📱 Formulário QR Code do Aluno",
         ],
+        index=indice_padrao,
     )
 
-    if modo == "📱 Formulário QR Code do Aluno (Telas 1 e 2)":
+    if modo == "📱 Formulário QR Code do Aluno":
         renderizar_formulario_mobile_aluno()
     else:
         if not st.session_state.get("autenticado", False):
