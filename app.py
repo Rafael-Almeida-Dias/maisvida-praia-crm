@@ -603,10 +603,10 @@ def renderizar_painel_gestor():
 
 def renderizar_formulario_mobile_aluno():
     st.markdown("## 📱 Auto-Cadastro Rápido de Aluno — MaisVida Praia")
-    st.caption("Preencha seus dados em poucos segundos para liberar seu treino e receber novidades!")
+    st.caption("Preencha seus dados em poucos segundos para ajudar nossa equipe a cuidar melhor de você!")
 
     if st.session_state.get("cadastro_enviado", False):
-        st.success("## ✔️ Cadastro concluído com sucesso! Bom treino na areia!")
+        st.success("## ✔️ Cadastro concluído com sucesso! Bom treino na nossa areia!")
         st.markdown(
             f"**Registro confirmado em:** `{st.session_state.get('ultimo_ts_cadastro')}`"
         )
