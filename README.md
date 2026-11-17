@@ -46,3 +46,60 @@ maisvida-praia-crm/
 ├── requirements.txt         # Dependências do ambiente Python
 ├── LICENSE                  # Licença MIT
 └── README.md                # Documentação técnica do projeto
+```
+
+---
+
+## Instalação e Execução Local
+
+### Pré-requisitos
+* Python 3.11 ou superior
+* Gerenciador de pacotes `pip`
+
+### Passo a passo
+
+1. Clone o repositório e acesse o diretório do projeto:
+```bash
+git clone [https://github.com/Rafael-Almeida-Dias/maisvida-praia-crm.git](https://github.com/Rafael-Almeida-Dias/maisvida-praia-crm.git)
+cd maisvida-praia-crm
+```
+
+2. Instale as dependências listadas:
+```bash
+pip install -r requirements.txt
+```
+
+3. (Opcional) Gere ou recrie a base de dados de homologação com 500 registros:
+```bash
+python seed_data.py
+```
+
+4. Inicie o servidor do Streamlit:
+```bash
+streamlit run app.py
+```
+
+---
+
+## Credenciais de Homologação
+
+Para avaliar o Painel Gerencial e o módulo CRUD no ambiente de demonstração, utilize as credenciais abaixo na tela de login:
+
+* **Usuário:** `gestor`
+* **Senha:** `MaisVida2026!`
+
+---
+
+## Execução de Testes Automatizados
+
+A integridade das regras de validação de datas (RF01) e sanitização contra ataques XSS (RNF02) é verificada por testes unitários com o framework `pytest`. Para executar a suíte localmente:
+
+```bash
+pytest test_app.py -v
+```
+
+---
+
+## Licença
+
+Distribuído sob a Licença MIT. Consulte o arquivo `LICENSE` para mais informações.
